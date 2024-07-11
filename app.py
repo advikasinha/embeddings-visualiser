@@ -91,18 +91,29 @@
 # )
 # st.plotly_chart(fig)
 
+import os
 import streamlit as st
+import subprocess
+
+# Ensure the setup is complete
+def run_setup():
+    if not os.path.exists("encoder/infersent1.pkl") or not os.path.exists("glove.840B.300d.txt"):
+        subprocess.run(["python", "setup.py"], check=True)
+
+# Run the setup
+run_setup()
+
+# Rest of the imports and code
 import pandas as pd
 import torch
 from datasets import load_dataset
-from transformers import CLIPProcessor, CLIPModel
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import umap
 import plotly.express as px
+from models import InferSent
 
 # Load dataset
-@st.cache
 def load_data():
     dataset = load_dataset("recastai/coyo-75k-augmented-captions")
     sentences = dataset['train']['short_caption']
@@ -110,31 +121,29 @@ def load_data():
     return sentences
 
 # Load model
-@st.cache(allow_output_mutation=True)
 def load_model():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    return model, processor, device
+    model_version = 1
+    MODEL_PATH = "encoder/infersent1.pkl"
+    W2V_PATH = 'glove.840B.300d.txt'
+    VOCAB_SIZE = 1e5  # Load embeddings of VOCAB_SIZE most frequent words
+    USE_CUDA = True  # Keep it on CPU if False, otherwise will put it on GPU
+
+    params_model = {'bsize': 64, 'word_emb_dim': 300, 'enc_lstm_dim': 2048,
+                    'pool_type': 'max', 'dpout_model': 0.0, 'version': model_version}
+    model = InferSent(params_model)
+    model.load_state_dict(torch.load(MODEL_PATH))
+    model = model.cuda() if USE_CUDA else model
+    model.set_w2v_path(W2V_PATH)
+    model.build_vocab_k_words(K=VOCAB_SIZE)
+    return model
 
 # Generate embeddings
-def generate_embeddings(sentences, model, processor, device):
-    batch_size = 32
-    text_features = []
-    for i in range(0, len(sentences), batch_size):
-        batch = sentences[i:i+batch_size]
-        inputs = processor(text=batch, return_tensors="pt", padding=True, truncation=True)
-        inputs = inputs.to(device)
-        with torch.no_grad():
-            batch_feature = model.get_text_features(**inputs)
-        text_features.append(batch_feature.to("cpu"))
-        del inputs, batch_feature
-        torch.cuda.empty_cache()
-    text_features = torch.cat(text_features, dim=0)
-    text_features_np = text_features.numpy()
-    embeddings = pd.DataFrame(text_features_np)
-    embeddings['prompt'] = sentences
-    return embeddings
+def generate_embeddings(sentences, model):
+    sentences_ = [str(sentence) for sentence in sentences]
+    embeddings = model.encode(sentences_, bsize=128, tokenize=False, verbose=True)
+    embeddings_df = pd.DataFrame(embeddings)
+    embeddings_df['prompt'] = sentences
+    return embeddings_df
 
 # Visualize embeddings
 def visualize_embeddings(embeddings):
@@ -169,10 +178,10 @@ def main():
     sentences = load_data()
 
     st.write("Loading model...")
-    model, processor, device = load_model()
+    model = load_model()
 
     st.write("Generating embeddings...")
-    embeddings = generate_embeddings(sentences, model, processor, device)
+    embeddings = generate_embeddings(sentences, model)
 
     st.write("Visualizing embeddings...")
     visualize_embeddings(embeddings)
