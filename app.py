@@ -15,16 +15,30 @@ from PIL import UnidentifiedImageError
 import plotly.express as px
 from tqdm import tqdm
 from sklearn.metrics import pairwise_distances
+from datasets import load_dataset
+
+st.set_page_config(page_title="CLIP Image Embeddings", layout="wide")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+@st.cache_resource
+def load_model():
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    return model, processor
 
-from datasets import load_dataset
+model, processor = load_model()
 
-train_dataset = load_dataset("recastai/coyo-75k-augmented-captions")['train']
-test_dataset = load_dataset("recastai/coyo-75k-augmented-captions")['test']
+@st.cache_data
+def load_dataset_safely():
+    try:
+        dataset = load_dataset("recastai/coyo-75k-augmented-captions")
+        return dataset['test']  # or 'train' if you prefer
+    except Exception as e:
+        st.error(f"Error loading dataset: {str(e)}")
+        return None
+
+test_dataset = load_dataset_safely()
 
 def plot_images_grid(images, text, grid_size=(5, 5), titles=None, size=(5, 5), cmap=None):
     from math import ceil
@@ -53,38 +67,34 @@ def plot_images_grid(images, text, grid_size=(5, 5), titles=None, size=(5, 5), c
     
     plt.tight_layout()
     st.sidebar.pyplot(fig)
-
+@st.cache_data
 def get_image_embeddings(data):
     error_count = 0
     error_urls = []
     image_embeddings = [] 
-    count = 0
     c = 0
-    data_text = data['llm_caption']
-    data_url = data['url']
     
-    dataframe = pd.DataFrame({'url': data_url, 'text': data_text})
-    for _, row in dataframe.iterrows():
-        image_url = row['url']
-        text = row['text'][0]
+    for item in tqdm(data[:max_images]):
+        image_url = item['url']
+        text = item['llm_caption'][0]  # selecting 1st caption for image from list
         try:
-            count += 1
-            if count == 500:
-                break
             response = requests.get(image_url)
             response.raise_for_status()
             image = Image.open(BytesIO(response.content))
             if c < 5:
                 plot_images_grid([image], [text], grid_size=(1, 1))
                 c += 1
+
             inputs = processor(images=image, return_tensors="pt").to(device)
             with torch.no_grad():
                 image_embedding = model.get_image_features(**inputs)
             image_embeddings.append(image_embedding.squeeze().cpu().numpy())
-        except (requests.exceptions.RequestException, UnidentifiedImageError, ValueError) as e:
+
+        except Exception as e:
             error_urls.append(image_url)
             error_count += 1
-    return image_embeddings, error_count
+
+    return np.array(image_embeddings), error_count
 
 def apply_pca(image_embeddings, n_components=3):
     pca = PCA(n_components=n_components)
@@ -164,63 +174,74 @@ def compute_gdp(X, X_embedded, n_neighbors=5):
     return np.sqrt(stress / original_sum)
 
 st.title("CLIP Image Embeddings")
-st.sidebar.image("dsg_iitr_logo.jpg", use_column_width=True)
+st.sidebar.image("https://example.com/dsg_iitr_logo.jpg", use_column_width=True)
 url = "https://huggingface.co/datasets/recastai/coyo-75k-augmented-captions"
-st.sidebar.text("The dataset is Subset of COYO 400M Image-Text pairs [link](%s)" % url)
-dim_reduction = st.selectbox("Choose Dimension Reduction Technique", ['PCA', 'UMAP', 'T-SNE'])
-clustering_algo = st.selectbox("Choose the clustering method", ['DBSCAN', 'K-MEANS'])
-n_cluster = st.slider("Number of clusters", 2, 10, 2) if clustering_algo == "K-MEANS" else None
+st.sidebar.markdown(f"The dataset is a Subset of [COYO 400M Image-Text pairs]({url})")
 
-image_embeddings, _ = get_image_embeddings(test_dataset)
+if test_dataset is None:
+    st.error("Failed to load the dataset. Please check your internet connection and try again.")
+else:
+    dim_reduction = st.selectbox("Choose Dimension Reduction Technique", ['PCA', 'UMAP', 'T-SNE'])
+    clustering_algo = st.selectbox("Choose the clustering method", ['DBSCAN', 'K-MEANS'])
+    n_cluster = st.slider("Number of clusters", 2, 10, 2) if clustering_algo == "K-MEANS" else None
 
-if dim_reduction == "PCA":
-    reduced_embeddings = apply_pca(image_embeddings)
-elif dim_reduction == "UMAP":
-    reduced_embeddings = apply_umap(image_embeddings)
-elif dim_reduction == "T-SNE":
-    reduced_embeddings = apply_tsne(image_embeddings)
+    max_images = st.slider("Maximum number of images to process", 100, 1000, 500)
+    
+    image_embeddings, error_count = get_image_embeddings(test_dataset, max_images)
 
-labels = cluster_embeddings(reduced_embeddings, method=clustering_algo, n_clusters=n_cluster)
-visualize_embeddings(reduced_embeddings, labels, clustering_algo, None, n_cluster)
+    if len(image_embeddings) > 0:
+        if dim_reduction == "PCA":
+            reduced_embeddings = apply_pca(image_embeddings)
+        elif dim_reduction == "UMAP":
+            reduced_embeddings = apply_umap(image_embeddings)
+        elif dim_reduction == "T-SNE":
+            reduced_embeddings = apply_tsne(image_embeddings)
 
-st.header("Comparison of Dimensionality Reduction Techniques")
+        labels = cluster_embeddings(reduced_embeddings, method=clustering_algo, n_clusters=n_cluster)
+        visualize_embeddings(reduced_embeddings, labels, clustering_algo, None, n_cluster)
 
-# Compute metrics for each technique
-trust_pca = trustworthiness(image_embeddings, apply_pca(image_embeddings))
-cont_pca = compute_continuity(image_embeddings, apply_pca(image_embeddings))
-gdp_pca = compute_gdp(image_embeddings, apply_pca(image_embeddings))
+        st.header("Comparison of Dimensionality Reduction Techniques")
 
-trust_umap = trustworthiness(image_embeddings, apply_umap(image_embeddings))
-cont_umap = compute_continuity(image_embeddings, apply_umap(image_embeddings))
-gdp_umap = compute_gdp(image_embeddings, apply_umap(image_embeddings))
+        # Compute metrics for each technique
+        trust_pca = trustworthiness(image_embeddings, apply_pca(image_embeddings))
+        cont_pca = compute_continuity(image_embeddings, apply_pca(image_embeddings))
+        gdp_pca = compute_gdp(image_embeddings, apply_pca(image_embeddings))
 
-trust_tsne = trustworthiness(image_embeddings, apply_tsne(image_embeddings))
-cont_tsne = compute_continuity(image_embeddings, apply_tsne(image_embeddings))
-gdp_tsne = compute_gdp(image_embeddings, apply_tsne(image_embeddings))
+        trust_umap = trustworthiness(image_embeddings, apply_umap(image_embeddings))
+        cont_umap = compute_continuity(image_embeddings, apply_umap(image_embeddings))
+        gdp_umap = compute_gdp(image_embeddings, apply_umap(image_embeddings))
 
-# Display results
-st.subheader("Metrics")
-st.write("Trustworthiness (higher is better):")
-st.write(f"PCA: {trust_pca:.4f}")
-st.write(f"UMAP: {trust_umap:.4f}")
-st.write(f"t-SNE: {trust_tsne:.4f}")
+        trust_tsne = trustworthiness(image_embeddings, apply_tsne(image_embeddings))
+        cont_tsne = compute_continuity(image_embeddings, apply_tsne(image_embeddings))
+        gdp_tsne = compute_gdp(image_embeddings, apply_tsne(image_embeddings))
 
-st.write("\nContinuity (higher is better):")
-st.write(f"PCA: {cont_pca:.4f}")
-st.write(f"UMAP: {cont_umap:.4f}")
-st.write(f"t-SNE: {cont_tsne:.4f}")
+        # Display results
+        st.subheader("Metrics")
+        st.write("Trustworthiness (higher is better):")
+        st.write(f"PCA: {trust_pca:.4f}")
+        st.write(f"UMAP: {trust_umap:.4f}")
+        st.write(f"t-SNE: {trust_tsne:.4f}")
 
-st.write("\nGeodesic Distance Preservation (lower is better):")
-st.write(f"PCA: {gdp_pca:.4f}")
-st.write(f"UMAP: {gdp_umap:.4f}")
-st.write(f"t-SNE: {gdp_tsne:.4f}")
+        st.write("\nContinuity (higher is better):")
+        st.write(f"PCA: {cont_pca:.4f}")
+        st.write(f"UMAP: {cont_umap:.4f}")
+        st.write(f"t-SNE: {cont_tsne:.4f}")
 
-# Determine the best technique
-best_trust = max(trust_pca, trust_umap, trust_tsne)
-best_cont = max(cont_pca, cont_umap, cont_tsne)
-best_gdp = min(gdp_pca, gdp_umap, gdp_tsne)
+        st.write("\nGeodesic Distance Preservation (lower is better):")
+        st.write(f"PCA: {gdp_pca:.4f}")
+        st.write(f"UMAP: {gdp_umap:.4f}")
+        st.write(f"t-SNE: {gdp_tsne:.4f}")
 
-st.subheader("Best Performing Technique")
-st.write(f"Best Trustworthiness: {best_trust:.4f}")
-st.write(f"Best Continuity: {best_cont:.4f}")
-st.write(f"Best Geodesic Distance Preservation: {best_gdp:.4f}")
+        # Determine the best technique
+        best_trust = max(trust_pca, trust_umap, trust_tsne)
+        best_cont = max(cont_pca, cont_umap, cont_tsne)
+        best_gdp = min(gdp_pca, gdp_umap, gdp_tsne)
+
+        st.subheader("Best Performing Technique")
+        st.write(f"Best Trustworthiness: {best_trust:.4f}")
+        st.write(f"Best Continuity: {best_cont:.4f}")
+        st.write(f"Best Geodesic Distance Preservation: {best_gdp:.4f}")
+    else:
+        st.error("No valid image embeddings were generated. Please check your dataset.")
+
+    st.write(f"Number of errors encountered: {error_count}")
