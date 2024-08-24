@@ -2,7 +2,7 @@ streamlit
 pandas
 numpy
 scikit-learn
-joblip
+joblib
 matplotlib
 ipython
 Pillow
